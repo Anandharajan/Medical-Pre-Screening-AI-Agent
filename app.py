@@ -93,7 +93,9 @@ if not st.session_state.patient_info:
             # Initialize conversation with AI introduction
             with st.chat_message("assistant", avatar="🤖"):
                 st.write(f"Hello {st.session_state.patient_info['name']}, I'm an Agentic AI Medical Assistant.")
-                st.write("I'll be conducting a brief interview to assess your condition. Can you tell me what's brought you in today?")
+                st.write("I'll be conducting a medical pre-screening interview to assess your condition.")
+                st.write("I need to ask you about 6-8 questions regarding your symptoms and medical history before I can provide a proper assessment.")
+                st.write("Let's begin with your primary concern - what has brought you in today?")
             
             # Get initial question using LangChain
             initial_response = handle_llm_interaction(
@@ -107,11 +109,24 @@ if not st.session_state.patient_info:
                 api_key=st.session_state.google_api_key
             )
             
+            # Extract just the question text from JSON response
+            try:
+                if isinstance(initial_response, str) and initial_response.startswith("[{"):
+                    question_data = json.loads(initial_response)
+                    if isinstance(question_data, list) and len(question_data) > 0:
+                        question_text = question_data[0].get("question", initial_response)
+                    else:
+                        question_text = initial_response
+                else:
+                    question_text = initial_response
+            except json.JSONDecodeError:
+                question_text = initial_response
+                
             st.session_state.conversation.append({
                 "role": "assistant",
-                "content": initial_response
+                "content": question_text
             })
-            st.session_state.current_question = initial_response
+            st.session_state.current_question = question_text
             
             st.rerun()
     st.stop()  # Stop execution until patient info is collected
@@ -147,6 +162,11 @@ def format_agent_response(response: str) -> str:
     # If this is a simple greeting message, return it as-is
     if "welcome to your medical pre-screening" in response.lower():
         return response
+        
+    # Handle final answers
+    if "Final Answer:" in response:
+        final_answer = response.split("Final Answer:")[1].strip()
+        return f"**{final_answer}**"
         
     # Format all assistant questions in bold
     if any(phrase in response.lower() for phrase in ["question:", "can you", "do you", "have you", "when did"]):
@@ -187,13 +207,13 @@ if user_input := st.chat_input("Type your response here..."):
     # Add user response to conversation
     st.session_state.conversation.append({"role": "user", "content": user_input})
     
-    # Check if we have collected enough information - require at least 3 complete Q&A pairs
-    if len(st.session_state.conversation) >= 6 and not st.session_state.info_complete:
-        # Verify we have at least 3 assistant questions and 3 user responses
+    # Check if we have collected enough information - require at least 6 complete Q&A pairs
+    if len(st.session_state.conversation) >= 12 and not st.session_state.info_complete:
+        # Verify we have at least 6 assistant questions and 6 user responses
         assistant_messages = [msg for msg in st.session_state.conversation if msg["role"] == "assistant"]
         user_messages = [msg for msg in st.session_state.conversation if msg["role"] == "user"]
         
-        if len(assistant_messages) >= 3 and len(user_messages) >= 3:
+        if len(assistant_messages) >= 6 and len(user_messages) >= 6:
             st.session_state.info_complete = True
     
     # Use agent to handle the conversation
@@ -260,10 +280,7 @@ if user_input := st.chat_input("Type your response here..."):
         )
     
     # Format and add agent response to conversation
-    formatted_response = f"""
-    Thought: Based on the patient's response, I need to gather more details about their symptoms.
-    Final Answer: {agent_response}
-    """
+    formatted_response = agent_response
     
     st.session_state.conversation.append({
         "role": "assistant",
