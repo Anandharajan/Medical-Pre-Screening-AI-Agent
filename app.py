@@ -148,14 +148,22 @@ def format_agent_response(response: str) -> str:
     if "welcome to your medical pre-screening" in response.lower():
         return response
         
-    # Format questions in bold
-    if "Question:" in response:
-        question_text = response.split("Question:")[1].split("\n")[0].strip()
-        formatted_question = f"**{question_text}**"
-        if "Reason:" in response:
-            reason_text = response.split("Reason:")[1].strip()
-            return f"{formatted_question}\n\n{reason_text}"
-        return formatted_question
+    # Format all assistant questions in bold
+    if any(phrase in response.lower() for phrase in ["question:", "can you", "do you", "have you", "when did"]):
+        # Split into lines and format each question line
+        lines = response.split("\n")
+        formatted_lines = []
+        
+        for line in lines:
+            if any(phrase in line.lower() for phrase in ["question:", "can you", "do you", "have you", "when did"]):
+                # Remove any existing markdown formatting
+                clean_line = line.replace("**", "").strip()
+                # Format the entire question line in bold
+                formatted_lines.append(f"**{clean_line}**")
+            else:
+                formatted_lines.append(line)
+        
+        return "\n".join(formatted_lines)
     
     # Handle tool responses
     if "[Tool Response]" in response:
@@ -179,9 +187,14 @@ if user_input := st.chat_input("Type your response here..."):
     # Add user response to conversation
     st.session_state.conversation.append({"role": "user", "content": user_input})
     
-    # Check if we have collected enough information
-    if len(st.session_state.conversation) >= 6:  # After 3 question-answer pairs
-        st.session_state.info_complete = True
+    # Check if we have collected enough information - require at least 3 complete Q&A pairs
+    if len(st.session_state.conversation) >= 6 and not st.session_state.info_complete:
+        # Verify we have at least 3 assistant questions and 3 user responses
+        assistant_messages = [msg for msg in st.session_state.conversation if msg["role"] == "assistant"]
+        user_messages = [msg for msg in st.session_state.conversation if msg["role"] == "user"]
+        
+        if len(assistant_messages) >= 3 and len(user_messages) >= 3:
+            st.session_state.info_complete = True
     
     # Use agent to handle the conversation
     conversation_history = "\n".join(
