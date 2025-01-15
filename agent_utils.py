@@ -61,15 +61,99 @@ def get_model(api_key: str = None):
     if not validate_api_key(api_key):
         raise ValueError("Invalid Google API key")
     
+    # Advanced rate limiting with queue and circuit breaker
+    import time
+    from datetime import datetime, timedelta
+    from collections import deque
+    import random
+    
+    # Initialize rate limiting state
+    if not hasattr(get_model, "rate_limiter"):
+        get_model.rate_limiter = {
+            "queue": deque(maxlen=30),  # Last 30 request timestamps
+            "circuit_open": False,
+            "circuit_open_time": None,
+            "retry_count": 0,
+            "max_retries": 3,
+            "rate_limit_window": timedelta(seconds=60),
+            "min_delay": 3.0,  # Increased minimum delay
+            "max_delay": 120.0,
+            "failure_threshold": 5,  # Number of failures before circuit opens
+            "failure_count": 0
+        }
+    
+    rate_limiter = get_model.rate_limiter
+    
+    # Check circuit breaker
+    if rate_limiter["circuit_open"]:
+        if datetime.now() - rate_limiter["circuit_open_time"] < timedelta(minutes=5):
+            raise RuntimeError("API circuit breaker is open - too many failures")
+        else:
+            rate_limiter["circuit_open"] = False
+            rate_limiter["failure_count"] = 0
+    
+    # Calculate time since last call
+    if rate_limiter["queue"]:
+        time_since_last_call = datetime.now() - rate_limiter["queue"][-1]
+    else:
+        time_since_last_call = timedelta(seconds=rate_limiter["min_delay"] + 1)
+    
+    # Enforce rate limits
+    if len(rate_limiter["queue"]) >= 30:
+        oldest_call = rate_limiter["queue"][0]
+        if datetime.now() - oldest_call < rate_limiter["rate_limit_window"]:
+            wait_time = (rate_limiter["rate_limit_window"] - (datetime.now() - oldest_call)).total_seconds()
+            print(f"Rate limit exceeded, waiting {wait_time:.1f} seconds...")
+            time.sleep(wait_time)
+    
+    # Enforce minimum delay with jitter
+    if time_since_last_call.total_seconds() < rate_limiter["min_delay"]:
+        jitter = random.uniform(0.5, 1.5)
+        wait_time = (rate_limiter["min_delay"] - time_since_last_call.total_seconds()) * jitter
+        time.sleep(wait_time)
+    
     try:
-        return ChatGoogleGenerativeAI(
+        model = ChatGoogleGenerativeAI(
             model="gemini-pro",
             google_api_key=api_key,
             temperature=0.7,
-            max_output_tokens=2048,
+            max_output_tokens=512,  # Further reduced to 512
             convert_system_message_to_human=True
         )
+        
+        # Update rate limiter state
+        rate_limiter["queue"].append(datetime.now())
+        rate_limiter["retry_count"] = 0
+        rate_limiter["failure_count"] = 0
+        
+        return model
+        
     except Exception as e:
+        rate_limiter["failure_count"] += 1
+        rate_limiter["retry_count"] += 1
+        
+        if rate_limiter["failure_count"] >= rate_limiter["failure_threshold"]:
+            rate_limiter["circuit_open"] = True
+            rate_limiter["circuit_open_time"] = datetime.now()
+            raise RuntimeError("API circuit breaker opened due to repeated failures")
+            
+        if "ResourceExhausted" in str(e):
+            # Exponential backoff with jitter
+            base_delay = 3.0  # Increased base delay
+            max_delay = rate_limiter["max_delay"]
+            jitter = random.uniform(0.8, 1.2)
+            retry_delay = min(
+                base_delay * (2 ** rate_limiter["retry_count"]) * jitter,
+                max_delay
+            )
+            
+            if rate_limiter["retry_count"] < rate_limiter["max_retries"]:
+                print(f"Rate limit hit, retrying in {retry_delay:.1f} seconds...")
+                time.sleep(retry_delay)
+                return get_model(api_key)
+            else:
+                raise RuntimeError("API rate limit exceeded after maximum retries")
+                
         print(f"Error configuring Google Generative AI: {str(e)}")
         raise
 
@@ -169,35 +253,70 @@ def create_conversation_chain(api_key: str = None) -> ConversationChain:
     )
 
 def handle_llm_interaction(prompt: str, tools: List[Dict[str, Any]], api_key: str = None) -> str:
-    """Handle LLM interaction using LangChain's conversation chain"""
-    conversation = create_conversation_chain(api_key)
+    """Handle LLM interaction with caching and fallback"""
+    from functools import lru_cache
     
-    # Add tools context to the prompt
-    tool_context = "\n".join([
-        f"Available tool: {tool.name} - {tool.description}"
-        for tool in tools
-    ])
+    # Common medical questions cache
+    @lru_cache(maxsize=100)
+    def get_cached_response(prompt_hash: int) -> str:
+        return None
     
-    # Get previous questions for context
-    previous_questions = memory.get_previous_questions()
+    # Check cache first
+    prompt_hash = hash(prompt)
+    cached_response = get_cached_response(prompt_hash)
+    if cached_response:
+        return cached_response
     
-    full_prompt = f"""
-    {prompt}
-    
-    Previous Questions:
-    {previous_questions}
-    
-    Available Tools:
-    {tool_context}
-    """
-    
+    # Try API first
     try:
+        conversation = create_conversation_chain(api_key)
+        
+        # Add tools context to the prompt
+        tool_context = "\n".join([
+            f"Available tool: {tool.name} - {tool.description}"
+            for tool in tools
+        ])
+        
+        # Get previous questions for context
+        previous_questions = memory.get_previous_questions()
+        
+        full_prompt = f"""
+        {prompt}
+        
+        Previous Questions:
+        {previous_questions}
+        
+        Available Tools:
+        {tool_context}
+        """
+        
         response = conversation.predict(input=full_prompt)
+        
+        # Cache the response
+        get_cached_response.cache_clear()
+        get_cached_response(prompt_hash)
+        
         # Store the interaction in memory
         memory.add_interaction(prompt, response)
         return response
-    except Exception as e:
-        return f"An error occurred while processing your request: {str(e)}. Please try again."
+        
+    except Exception as api_error:
+        # Fallback to local model if API fails
+        try:
+            from transformers import pipeline
+            local_model = pipeline("text-generation", model="gpt2")
+            response = local_model(prompt, max_length=512, do_sample=True)[0]['generated_text']
+            
+            # Store in cache and memory
+            get_cached_response.cache_clear()
+            get_cached_response(prompt_hash)
+            memory.add_interaction(prompt, response)
+            
+            return response
+            
+        except Exception as local_error:
+            # Final fallback to static response
+            return "I'm currently experiencing high demand. Please try again shortly or provide more details about your medical concern."
 
 def reflect(previous_question: str, user_response: str, reflection_prompt: str, api_key: str = None) -> str:
     """Reflect on the user's response and assess phase completeness"""
