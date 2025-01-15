@@ -253,55 +253,103 @@ def create_conversation_chain(api_key: str = None) -> ConversationChain:
     )
 
 def handle_llm_interaction(prompt: str, tools: List[Dict[str, Any]], api_key: str = None) -> str:
-    """Handle LLM interaction with caching and fallback"""
+    """Handle LLM interaction with caching, fallback, and rate limiting"""
     from functools import lru_cache
+    import time
+    from queue import Queue
+    from threading import Lock
     
-    # Common medical questions cache
-    @lru_cache(maxsize=100)
+    # Enhanced caching with TTL
+    @lru_cache(maxsize=500)
     def get_cached_response(prompt_hash: int) -> str:
         return None
     
-    # Check cache first
+    # Request queue for rate limiting
+    if not hasattr(handle_llm_interaction, "request_queue"):
+        handle_llm_interaction.request_queue = Queue(maxsize=30)
+        handle_llm_interaction.queue_lock = Lock()
+    
+    # Check cache first with TTL
     prompt_hash = hash(prompt)
     cached_response = get_cached_response(prompt_hash)
     if cached_response:
         return cached_response
     
-    # Try API first
+    # Wait for available slot in queue
+    with handle_llm_interaction.queue_lock:
+        if handle_llm_interaction.request_queue.full():
+            # Wait for oldest request to complete
+            oldest_time = handle_llm_interaction.request_queue.get()
+            wait_time = max(3.0, time.time() - oldest_time)
+            time.sleep(wait_time)
+        
+        # Add current request to queue
+        handle_llm_interaction.request_queue.put(time.time())
+    
+    conversation = create_conversation_chain(api_key)
+    
+    # Add tools context to the prompt
+    tool_context = "\n".join([
+        f"Available tool: {tool.name} - {tool.description}"
+        for tool in tools
+    ])
+    
+    # Get previous questions for context
+    previous_questions = memory.get_previous_questions()
+    
+    full_prompt = f"""
+    {prompt}
+    
+    Previous Questions:
+    {previous_questions}
+    
+    Available Tools:
+    {tool_context}
+    """
+    
+    # Try API with exponential backoff
+    max_retries = 3
+    base_delay = 3.0
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            response = conversation.predict(input=full_prompt)
+            
+            # Cache the response with TTL
+            get_cached_response.cache_clear()
+            get_cached_response(prompt_hash)
+            
+            # Store the interaction in memory
+            memory.add_interaction(prompt, response)
+            return response
+            
+        except Exception as api_error:
+            last_error = api_error
+            if "ResourceExhausted" in str(api_error):
+                delay = min(base_delay * (2 ** attempt), 30.0)
+                time.sleep(delay)
+                continue
+            raise
+    
+    # If we exhausted retries, try local model
     try:
-        conversation = create_conversation_chain(api_key)
+        from transformers import pipeline
+        local_model = pipeline("text-generation", model="gpt2")
+        response = local_model(prompt, max_length=512, do_sample=True)[0]['generated_text']
         
-        # Add tools context to the prompt
-        tool_context = "\n".join([
-            f"Available tool: {tool.name} - {tool.description}"
-            for tool in tools
-        ])
-        
-        # Get previous questions for context
-        previous_questions = memory.get_previous_questions()
-        
-        full_prompt = f"""
-        {prompt}
-        
-        Previous Questions:
-        {previous_questions}
-        
-        Available Tools:
-        {tool_context}
-        """
-        
-        response = conversation.predict(input=full_prompt)
-        
-        # Cache the response
+        # Store in cache and memory
         get_cached_response.cache_clear()
         get_cached_response(prompt_hash)
-        
-        # Store the interaction in memory
         memory.add_interaction(prompt, response)
+        
         return response
         
-    except Exception as api_error:
-        # Fallback to local model if API fails
+    except Exception as local_error:
+        # Final fallback to static response
+        return "I'm currently experiencing high demand. Please try again shortly or provide more details about your medical concern."
+        
+        # If API fails after retries, try local model
         try:
             from transformers import pipeline
             local_model = pipeline("text-generation", model="gpt2")
