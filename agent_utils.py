@@ -1,4 +1,6 @@
 import os
+import random
+import time
 from dotenv import load_dotenv
 from functools import lru_cache
 from typing import List, Dict, Any
@@ -16,25 +18,40 @@ from langchain.schema import AIMessage, HumanMessage
 
 load_dotenv()
 
-# Persistent conversation memory
+# Persistent conversation memory with size limits
 class PersistentMemory:
-    def __init__(self):
+    def __init__(self, max_messages=100):
         self.memory = ConversationBufferMemory(memory_key="chat_history", input_key="input")
         self.previous_questions = []
+        self.max_messages = max_messages
+        self.message_count = 0
     
     def add_interaction(self, question: str, response: str):
+        # Clean up old messages if we're over limit
+        if self.message_count >= self.max_messages:
+            # Remove oldest messages
+            self.memory.chat_memory.messages = self.memory.chat_memory.messages[2:]
+            self.previous_questions = self.previous_questions[1:]
+            self.message_count -= 1
+        
         self.memory.chat_memory.add_user_message(question)
         self.memory.chat_memory.add_ai_message(response)
         self.previous_questions.append(question)
+        self.message_count += 1
     
     def get_memory(self):
         return self.memory
     
     def get_previous_questions(self):
         return self.previous_questions
+    
+    def clear_memory(self):
+        self.memory.clear()
+        self.previous_questions = []
+        self.message_count = 0
 
-# Singleton memory instance
-memory = PersistentMemory()
+# Singleton memory instance with 100 message limit
+memory = PersistentMemory(max_messages=100)
 
 def validate_api_key(api_key: str) -> bool:
     """Validate the Google API key"""
@@ -51,111 +68,88 @@ def validate_api_key(api_key: str) -> bool:
     except Exception:
         return False
 
-# Cache models to avoid repeated initialization
-@lru_cache(maxsize=1)
 def get_model(api_key: str = None):
-    """Get cached model instance using LangChain's GoogleGenerativeAI wrapper"""
+    """Get model instance with enhanced rate limiting and monitoring"""
     if not api_key:
         raise ValueError("Google API key is required")
     
     if not validate_api_key(api_key):
         raise ValueError("Invalid Google API key")
     
-    # Advanced rate limiting with queue and circuit breaker
-    import time
-    from datetime import datetime, timedelta
-    from collections import deque
-    import random
+    # Enhanced rate limiting with jitter and longer backoff
+    max_retries = 5
+    base_delay = 2.0  # seconds
+    max_delay = 30.0  # seconds
     
-    # Initialize rate limiting state
-    if not hasattr(get_model, "rate_limiter"):
-        get_model.rate_limiter = {
-            "queue": deque(maxlen=30),  # Last 30 request timestamps
-            "circuit_open": False,
-            "circuit_open_time": None,
-            "retry_count": 0,
-            "max_retries": 3,
-            "rate_limit_window": timedelta(seconds=60),
-            "min_delay": 3.0,  # Increased minimum delay
-            "max_delay": 120.0,
-            "failure_threshold": 5,  # Number of failures before circuit opens
-            "failure_count": 0
-        }
-    
-    rate_limiter = get_model.rate_limiter
-    
-    # Check circuit breaker
-    if rate_limiter["circuit_open"]:
-        if datetime.now() - rate_limiter["circuit_open_time"] < timedelta(minutes=5):
-            raise RuntimeError("API circuit breaker is open - too many failures")
-        else:
-            rate_limiter["circuit_open"] = False
-            rate_limiter["failure_count"] = 0
-    
-    # Calculate time since last call
-    if rate_limiter["queue"]:
-        time_since_last_call = datetime.now() - rate_limiter["queue"][-1]
-    else:
-        time_since_last_call = timedelta(seconds=rate_limiter["min_delay"] + 1)
-    
-    # Enforce rate limits
-    if len(rate_limiter["queue"]) >= 30:
-        oldest_call = rate_limiter["queue"][0]
-        if datetime.now() - oldest_call < rate_limiter["rate_limit_window"]:
-            wait_time = (rate_limiter["rate_limit_window"] - (datetime.now() - oldest_call)).total_seconds()
-            print(f"Rate limit exceeded, waiting {wait_time:.1f} seconds...")
-            time.sleep(wait_time)
-    
-    # Enforce minimum delay with jitter
-    if time_since_last_call.total_seconds() < rate_limiter["min_delay"]:
-        jitter = random.uniform(0.5, 1.5)
-        wait_time = (rate_limiter["min_delay"] - time_since_last_call.total_seconds()) * jitter
-        time.sleep(wait_time)
-    
-    try:
-        model = ChatGoogleGenerativeAI(
-            model="gemini-pro",
-            google_api_key=api_key,
-            temperature=0.7,
-            max_output_tokens=512,  # Further reduced to 512
-            convert_system_message_to_human=True
-        )
-        
-        # Update rate limiter state
-        rate_limiter["queue"].append(datetime.now())
-        rate_limiter["retry_count"] = 0
-        rate_limiter["failure_count"] = 0
-        
-        return model
-        
-    except Exception as e:
-        rate_limiter["failure_count"] += 1
-        rate_limiter["retry_count"] += 1
-        
-        if rate_limiter["failure_count"] >= rate_limiter["failure_threshold"]:
-            rate_limiter["circuit_open"] = True
-            rate_limiter["circuit_open_time"] = datetime.now()
-            raise RuntimeError("API circuit breaker opened due to repeated failures")
-            
-        if "ResourceExhausted" in str(e):
-            # Exponential backoff with jitter
-            base_delay = 3.0  # Increased base delay
-            max_delay = rate_limiter["max_delay"]
-            jitter = random.uniform(0.8, 1.2)
-            retry_delay = min(
-                base_delay * (2 ** rate_limiter["retry_count"]) * jitter,
-                max_delay
+    for attempt in range(max_retries):
+        try:
+            model = ChatGoogleGenerativeAI(
+                model="gemini-pro",
+                google_api_key=api_key,
+                temperature=0.7,
+                max_output_tokens=1024,  # Increased for better responses
+                convert_system_message_to_human=True,
+                request_timeout=10.0,  # Increased timeout
+                max_retries=0  # Let our custom logic handle retries
             )
             
-            if rate_limiter["retry_count"] < rate_limiter["max_retries"]:
-                print(f"Rate limit hit, retrying in {retry_delay:.1f} seconds...")
-                time.sleep(retry_delay)
-                return get_model(api_key)
-            else:
-                raise RuntimeError("API rate limit exceeded after maximum retries")
+            # Test the model with a small prompt
+            test_response = model.invoke("Test")
+            if not test_response.content:
+                raise ValueError("Empty response from model")
                 
-        print(f"Error configuring Google Generative AI: {str(e)}")
-        raise
+            return model
+                
+        except Exception as e:
+            if "ResourceExhausted" in str(e):
+                # Exponential backoff with jitter
+                delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+                time.sleep(delay)
+                continue
+            elif attempt == max_retries - 1:
+                raise RuntimeError(f"API request failed after {max_retries} attempts: {str(e)}")
+            else:
+                raise
+
+    # Enhanced API usage tracking
+    if not hasattr(get_model, 'api_usage'):
+        get_model.api_usage = {
+            'total_calls': 0,
+            'failed_calls': 0,
+            'last_call': None,
+            'rate_limit': 60,  # calls per minute
+            'window_start': time.time(),
+            'call_count': 0
+        }
+    
+    # Reset rate limit window if expired
+    if time.time() - get_model.api_usage['window_start'] > 60:
+        get_model.api_usage['window_start'] = time.time()
+        get_model.api_usage['call_count'] = 0
+    
+    # Enforce rate limiting
+    get_model.api_usage['call_count'] += 1
+    if get_model.api_usage['call_count'] > get_model.api_usage['rate_limit']:
+        wait_time = 60 - (time.time() - get_model.api_usage['window_start'])
+        time.sleep(wait_time)
+        get_model.api_usage['window_start'] = time.time()
+        get_model.api_usage['call_count'] = 1
+    
+    get_model.api_usage['total_calls'] += 1
+    get_model.api_usage['last_call'] = time.time()
+    
+    if attempt > 0:
+        get_model.api_usage['failed_calls'] += 1
+        
+    # Dynamic rate limiting based on failures
+    if get_model.api_usage['failed_calls'] > 5:
+        # Reduce rate limit if too many failures
+        get_model.api_usage['rate_limit'] = max(30, get_model.api_usage['rate_limit'] - 10)
+        print(f"Reduced rate limit to {get_model.api_usage['rate_limit']} calls/minute due to failures")
+    
+    # Log usage every 10 calls
+    if get_model.api_usage['total_calls'] % 10 == 0:
+        print(f"API usage: {get_model.api_usage['total_calls']} total calls, {get_model.api_usage['failed_calls']} failures")
 
 def create_tools() -> List[Dict[str, Any]]:
     """Create and return a list of tools for medical pre-screening"""
@@ -253,118 +247,45 @@ def create_conversation_chain(api_key: str = None) -> ConversationChain:
     )
 
 def handle_llm_interaction(prompt: str, tools: List[Dict[str, Any]], api_key: str = None) -> str:
-    """Handle LLM interaction with caching, fallback, and rate limiting"""
-    from functools import lru_cache
-    import time
-    from queue import Queue
-    from threading import Lock
-    
-    # Enhanced caching with TTL
-    @lru_cache(maxsize=500)
-    def get_cached_response(prompt_hash: int) -> str:
-        return None
-    
-    # Request queue for rate limiting
-    if not hasattr(handle_llm_interaction, "request_queue"):
-        handle_llm_interaction.request_queue = Queue(maxsize=30)
-        handle_llm_interaction.queue_lock = Lock()
-    
-    # Check cache first with TTL
-    prompt_hash = hash(prompt)
-    cached_response = get_cached_response(prompt_hash)
-    if cached_response:
-        return cached_response
-    
-    # Wait for available slot in queue
-    with handle_llm_interaction.queue_lock:
-        if handle_llm_interaction.request_queue.full():
-            # Wait for oldest request to complete
-            oldest_time = handle_llm_interaction.request_queue.get()
-            wait_time = max(3.0, time.time() - oldest_time)
-            time.sleep(wait_time)
-        
-        # Add current request to queue
-        handle_llm_interaction.request_queue.put(time.time())
-    
-    conversation = create_conversation_chain(api_key)
-    
-    # Add tools context to the prompt
-    tool_context = "\n".join([
-        f"Available tool: {tool.name} - {tool.description}"
-        for tool in tools
-    ])
-    
-    # Get previous questions for context
-    previous_questions = memory.get_previous_questions()
-    
-    full_prompt = f"""
-    {prompt}
-    
-    Previous Questions:
-    {previous_questions}
-    
-    Available Tools:
-    {tool_context}
-    """
-    
-    # Try API with exponential backoff
-    max_retries = 3
-    base_delay = 3.0
-    last_error = None
-    
-    for attempt in range(max_retries):
-        try:
-            response = conversation.predict(input=full_prompt)
-            
-            # Cache the response with TTL
-            get_cached_response.cache_clear()
-            get_cached_response(prompt_hash)
-            
-            # Store the interaction in memory
-            memory.add_interaction(prompt, response)
-            return response
-            
-        except Exception as api_error:
-            last_error = api_error
-            if "ResourceExhausted" in str(api_error):
-                delay = min(base_delay * (2 ** attempt), 30.0)
-                time.sleep(delay)
-                continue
-            raise
-    
-    # If we exhausted retries, try local model
+    """Handle LLM interaction with simplified flow"""
     try:
-        from transformers import pipeline
-        local_model = pipeline("text-generation", model="gpt2")
-        response = local_model(prompt, max_length=512, do_sample=True)[0]['generated_text']
+        conversation = create_conversation_chain(api_key)
         
-        # Store in cache and memory
-        get_cached_response.cache_clear()
-        get_cached_response(prompt_hash)
+        # Add tools context to the prompt
+        tool_context = "\n".join([
+            f"Available tool: {tool.name} - {tool.description}"
+            for tool in tools
+        ])
+        
+        # Get previous questions for context
+        previous_questions = memory.get_previous_questions()
+        
+        full_prompt = f"""
+        {prompt}
+        
+        Previous Questions:
+        {previous_questions}
+        
+        Available Tools:
+        {tool_context}
+        """
+        
+        # Single attempt with timeout
+        response = conversation.predict(input=full_prompt)
         memory.add_interaction(prompt, response)
-        
         return response
         
-    except Exception as local_error:
-        # Final fallback to static response
-        return "I'm currently experiencing high demand. Please try again shortly or provide more details about your medical concern."
-        
-        # If API fails after retries, try local model
-        try:
-            from transformers import pipeline
-            local_model = pipeline("text-generation", model="gpt2")
-            response = local_model(prompt, max_length=512, do_sample=True)[0]['generated_text']
-            
-            # Store in cache and memory
-            get_cached_response.cache_clear()
-            get_cached_response(prompt_hash)
-            memory.add_interaction(prompt, response)
-            
-            return response
-            
-        except Exception as local_error:
-            # Final fallback to static response
-            return "I'm currently experiencing high demand. Please try again shortly or provide more details about your medical concern."
+    except Exception as e:
+        if "ResourceExhausted" in str(e):
+            # Single retry with short delay
+            time.sleep(1.5)
+            try:
+                response = conversation.predict(input=full_prompt)
+                memory.add_interaction(prompt, response)
+                return response
+            except:
+                return "I'm currently experiencing high demand. Please try again shortly."
+        return "I'm currently experiencing high demand. Please try again shortly."
 
 def reflect(previous_question: str, user_response: str, reflection_prompt: str, api_key: str = None) -> str:
     """Reflect on the user's response and assess phase completeness"""
@@ -452,10 +373,49 @@ def reflect(previous_question: str, user_response: str, reflection_prompt: str, 
         print(f"Error generating reflection: {str(e)}")
         return "Can you please provide more details about your symptoms and medical history?"
 
+# Cached common medical questions
+COMMON_QUESTIONS = {
+    "chief_complaint": [
+        "Can you describe your main symptoms?",
+        "When did these symptoms first appear?",
+        "How would you describe the severity of your symptoms?",
+        "What makes your symptoms better or worse?"
+    ],
+    "cardiovascular": [
+        "Do you experience any chest pain? If so, can you describe it?",
+        "Have you noticed any irregular heartbeats or palpitations?",
+        "Do you have any swelling in your legs or feet?"
+    ],
+    "respiratory": [
+        "Do you experience shortness of breath? When does it occur?",
+        "Do you have a cough? If so, is it productive?",
+        "Have you noticed any wheezing or difficulty breathing?"
+    ],
+    "gastrointestinal": [
+        "Have you experienced any nausea or vomiting?",
+        "Have you noticed any changes in your bowel movements?",
+        "Do you have any abdominal pain? If so, where is it located?"
+    ],
+    "neurological": [
+        "Do you experience headaches? If so, how would you describe them?",
+        "Have you felt dizzy or lightheaded?",
+        "Have you experienced any weakness or numbness?"
+    ],
+    "other_symptoms": [
+        "Have you had a fever? If so, how high and for how long?",
+        "Have you noticed any recent weight changes?",
+        "Have you been feeling unusually tired or fatigued?"
+    ],
+    "medical_history": [
+        "Do you have any existing medical conditions?",
+        "Have you had any surgeries or hospitalizations?",
+        "Are you currently taking any medications?",
+        "Do you have any known allergies?"
+    ]
+}
+
 def generate_next_question(user_response: str, reflection: str, previous_questions: List[str], api_key: str = None) -> str:
-    """Generate the next question following structured interview protocol"""
-    conversation = create_conversation_chain(api_key)
-    
+    """Generate the next question using cached questions when possible"""
     # Determine current phase based on previous questions
     current_phase = "chief_complaint"
     if any(q.lower() in ["chest pain", "palpitations", "edema"] for q in previous_questions):
@@ -471,80 +431,33 @@ def generate_next_question(user_response: str, reflection: str, previous_questio
     elif any(q.lower() in ["past medical", "surgeries", "medications", "allergies"] for q in previous_questions):
         current_phase = "medical_history"
     
-    phase_prompts = {
-        "chief_complaint": """
-        Focus on the patient's primary concern:
-        1. Ask about main symptoms
-        2. Establish timeline (onset, duration, frequency)
-        3. Characterize symptoms (quality, severity, location)
-        4. Identify aggravating/alleviating factors
-        """,
-        "cardiovascular": """
-        Assess cardiovascular system:
-        1. Chest pain (character, radiation, triggers)
-        2. Palpitations (frequency, duration)
-        3. Edema (location, timing, associated symptoms)
-        """,
-        "respiratory": """
-        Assess respiratory system:
-        1. Shortness of breath (timing, triggers)
-        2. Cough (character, duration, sputum)
-        3. Wheezing (timing, triggers)
-        """,
-        "gastrointestinal": """
-        Assess gastrointestinal system:
-        1. Nausea/vomiting (timing, content)
-        2. Diarrhea/constipation (frequency, character)
-        3. Abdominal pain (location, character, radiation)
-        """,
-        "neurological": """
-        Assess neurological system:
-        1. Headache (character, location, triggers)
-        2. Dizziness (type, triggers)
-        3. Weakness/numbness (location, progression)
-        """,
-        "other_symptoms": """
-        Assess general symptoms:
-        1. Fever (duration, pattern)
-        2. Weight changes (amount, timeframe)
-        3. Fatigue (severity, impact)
-        """,
-        "medical_history": """
-        Gather medical history:
-        1. Past medical conditions
-        2. Surgeries and hospitalizations
-        3. Medications and allergies
-        4. Family history of major diseases
-        """
-    }
+    # Get cached questions for this phase
+    phase_questions = COMMON_QUESTIONS[current_phase]
     
-    prompt = f"""
-    Current interview phase: {current_phase}
-    Phase focus: {phase_prompts[current_phase]}
+    # Find first question not already asked
+    for question in phase_questions:
+        if not any(q.lower() in question.lower() for q in previous_questions):
+            memory.add_interaction(question, user_response)
+            return question
     
-    Previous questions: {previous_questions}
-    Patient's most recent response: {user_response}
-    Your reflection on the response: {reflection}
-
-    Generate a detailed follow-up question that:
-    1. Aligns with current interview phase
-    2. Builds on previous questions and responses
-    3. Seeks specific information needed for a complete medical report
-    4. Uses a professional yet empathetic tone
-    5. Helps gather comprehensive medical information
-    6. Always ends with a question mark
-    7. Maintains conversation context from previous interactions
-    8. Avoids repeating previously asked questions
-    """
+    # If all cached questions have been asked, use LangChain for complex follow-up
+    if "urgent" in reflection.lower() or "critical" in reflection.lower():
+        conversation = create_conversation_chain(api_key)
+        try:
+            prompt = f"""
+            Based on this response and reflection, generate a critical follow-up question:
+            Patient response: {user_response}
+            Reflection: {reflection}
+            Previous questions: {previous_questions}
+            """
+            response = conversation.predict(input=prompt)
+            memory.add_interaction(response, user_response)
+            return response
+        except Exception as e:
+            print(f"Error generating critical question: {str(e)}")
     
-    try:
-        response = conversation.predict(input=prompt)
-        # Store the generated question in memory
-        memory.add_interaction(response, user_response)
-        return response
-    except Exception as e:
-        print(f"Error generating next question: {str(e)}")
-        return "Can you describe your symptoms in more detail?"
+    # Fallback to simple question
+    return "Can you please provide more details about that?"
 
 def initial_question(api_key: str = None) -> str:
     """Generate the initial question using LangChain"""

@@ -15,17 +15,36 @@ import os
 # Configure Streamlit page
 st.set_page_config(page_title="Medical Pre-Screening", page_icon="🏥", layout="wide")
 
-# Initialize session state
+# Initialize session state with size limits
+MAX_CONVERSATION_LENGTH = 50  # Maximum number of messages to store
+
 if 'conversation' not in st.session_state:
     st.session_state.conversation = []
+    st.session_state.conversation_size = 0
+    
 if 'current_question' not in st.session_state:
     st.session_state.current_question = None
+    
 if 'patient_info' not in st.session_state:
     st.session_state.patient_info = {}
+    
 if 'tools' not in st.session_state:
     st.session_state.tools = create_tools()
+    
 if 'info_complete' not in st.session_state:
     st.session_state.info_complete = False
+
+def add_to_conversation(role: str, content: str):
+    """Add message to conversation with size limits"""
+    if len(st.session_state.conversation) >= MAX_CONVERSATION_LENGTH:
+        # Remove oldest messages
+        st.session_state.conversation = st.session_state.conversation[1:]
+        
+    st.session_state.conversation.append({
+        "role": role,
+        "content": content
+    })
+    st.session_state.conversation_size = len(st.session_state.conversation)
 
 # Initialize API key in session state
 if 'google_api_key' not in st.session_state:
@@ -122,10 +141,7 @@ if not st.session_state.patient_info:
             except json.JSONDecodeError:
                 question_text = initial_response
                 
-            st.session_state.conversation.append({
-                "role": "assistant",
-                "content": question_text
-            })
+            add_to_conversation("assistant", question_text)
             st.session_state.current_question = question_text
             
             st.rerun()
@@ -147,10 +163,7 @@ else:
             st.session_state.tools,
             api_key=st.session_state.google_api_key
         )
-        st.session_state.conversation.append({
-            "role": "assistant",
-            "content": initial_response
-        })
+        add_to_conversation("assistant", initial_response)
         st.session_state.current_question = initial_response
 
 # Custom icons
@@ -205,7 +218,7 @@ for message in st.session_state.conversation:
 user_input = None
 if user_input := st.chat_input("Type your response here..."):
     # Add user response to conversation
-    st.session_state.conversation.append({"role": "user", "content": user_input})
+    add_to_conversation("user", user_input)
     
     # Check if we have collected enough information - require at least 6 complete Q&A pairs
     if len(st.session_state.conversation) >= 12 and not st.session_state.info_complete:
@@ -248,36 +261,26 @@ if user_input := st.chat_input("Type your response here..."):
             api_key=st.session_state.google_api_key
         )
     else:
-        # Generate analysis after all questions are answered
-        analysis_prompt = f"""
-        You are a medical professional analyzing a patient's pre-screening responses.
-        Based on the following information, prepare a detailed medical report:
-        {conversation_history}
+        # Generate structured report using report generator
+        from report_utils import MedicalReportGenerator
         
-        The report must include:
-        1. Clinical History and Risk Factors
-        2. Vital Signs and General Health Indicators
-        3. Laboratory Test Results (if available)
-        4. Cardiovascular and Metabolic Assessment
-        5. Imaging Study Recommendations (if needed)
-        6. Specialty Screening Recommendations
-        7. Functional and Cognitive Assessment
-        8. Psychological and Mental Health Evaluation
-        9. Risk Stratification and Health Score
-        10. Comprehensive Analysis and Next Steps
-        
-        Use medical terminology and provide specific recommendations for:
-        - Further diagnostic tests
-        - Specialist referrals
-        - Lifestyle modifications
-        - Preventive measures
-        - Urgent interventions (if needed)
-        """
-        agent_response = handle_llm_interaction(
-            analysis_prompt,
-            st.session_state.tools,
-            api_key=st.session_state.google_api_key
+        report_generator = MedicalReportGenerator(
+            conversation_history=st.session_state.conversation,
+            patient_info=st.session_state.patient_info
         )
+        
+        # Generate and safely format the report
+        report = report_generator.generate_report()
+        formatted_report = report_generator.safe_format_report(report)
+        
+        # Add report to conversation
+        agent_response = f"""
+        ## Medical Pre-Screening Report
+        
+        {formatted_report}
+        
+        **Please review this report carefully and consult with your healthcare provider.**
+        """
     
     # Format and add agent response to conversation
     formatted_response = agent_response
